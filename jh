@@ -1,326 +1,375 @@
-تمام — عدّلت لك السكربت عشان يضيف:
+تمام! جهزت لك Console App (Batch .CMD) منظم بقائمة تفاعلية يعمل الآتي:
 
-1. Logging (فايروول يسجّل الـ dropped connections + NPS/ RRAS Accounting).
+إعداد RRAS لعمل L2TP/IPsec VPN بمفتاح مشترك (PSK) + رينج عناوين عملاء.
 
+تفعيل NPS وإنشاء Policy يسمح فقط لأعضاء جروب VPN_Users (محليًا أو في الدومين).
 
-2. استعادة الإعدادات (Rollback) بزرار واحد.
+Logging: تفعيل لوج الفايروول + NPS.
 
+إدارة المستخدمين (إضافة/حذف) وإضافتهم لجروب الـ VPN.
 
-3. تفعيل NPS وربطه بـ RRAS مع Policy تقبل أعضاء جروب (مثلًا: VPN_Users).
+تعديل الإعدادات (PSK، رينج العناوين، تقييد RDP).
 
+فتح أدوات GUI المفيدة (RRAS / NPS / Firewall / Local Users …).
 
-
-> شغّل السكربت Run as Administrator.
-الاستخدام السريع:
-
-إعداد كامل: .\Setup-VPN.ps1 -Setup -VpnGroup "VPN_Users"
-
-استعادة/إلغاء كل التغييرات: .\Setup-VPN.ps1 -Rollback
+Rollback لاسترجاع معظم التغييرات.
 
 
+انسخ الكود التالي في ملف باسم مثلًا: VpnConsole.cmd وشغّله Run as Administrator.
 
+@echo off
+setlocal EnableExtensions EnableDelayedExpansion
+title VPN Console (RRAS + NPS) - L2TP/IPsec
 
-<# 
-    Setup / Rollback: RRAS L2TP/IPsec + NPS + Logging + RDP hardening
-    Tested on Windows Server 2016/2019/2022
+REM =====================[ CONFIG (Editable) ]=====================
+set "PSK=ChangeMe-StrongPSK!"
+set "VPN_POOL_START=10.10.50.100"
+set "VPN_POOL_END=10.10.50.200"
+set "VPN_SUBNET_CIDR=10.10.50.0/24"
+set "VPN_GROUP=VPN_Users"
+set "FIREWALL_LOG=C:\Windows\System32\LogFiles\Firewall\pfirewall.log"
+set "FIREWALL_LOG_MAXKB=32768"
+REM ===============================================================
 
-    FEATURES:
-    - RRAS L2TP/IPsec (PSK)
-    - NPS installed, registered in AD, Network Policy (allow only AD group)
-    - Logging:
-        * Windows Firewall: log dropped packets + allowed connections
-        * NPS accounting to file
-        * RRAS accounting on NPS (local)
-    - RDP hardened: only VPN subnet; blocks others
-    - Rollback switch to revert most changes
-
-    NOTES:
-    * اعمل Port Forward على الراوتر: UDP 500, UDP 4500, UDP 1701 -> للسيرفر
-    * لو السيرفر عضو دومين: السكربت هيسجّل NPS في Active Directory تلقائيًا (مطلوب حقوق Domain Admin لذلك؛ لو مش متاح هيكمل من غير التسجيل).
-#>
-
-[CmdletBinding()]
-param(
-    [switch]$Setup,
-    [switch]$Rollback,
-
-    # ==== إعدادات VPN ====
-    [string]$L2tpPsk = "ChangeMe-StrongPSK!",
-    [string]$VpnPoolStart = "10.10.50.100",
-    [string]$VpnPoolEnd   = "10.10.50.200",
-    [string]$VpnSubnetCidr= "10.10.50.0/24",
-
-    # ==== أمان ====
-    [switch]$RestrictRdp = $true,
-    [switch]$HardenAuthToMschapv2 = $true,
-    [switch]$RequireMaxEncryption = $true,
-
-    # ==== NPS ====
-    # اسم الجروب في AD المسموح لها تستخدم الـ VPN
-    [string]$VpnGroup = "VPN_Users",
-
-    # ==== Logging ====
-    [switch]$EnableLogging = $true,
-    [string]$FirewallLogPath = "C:\Windows\System32\LogFiles\Firewall\pfirewall.log",
-    [int]$FirewallLogMaxKB = 32768,   # 32MB
-    [string]$NpsLogFolder = "C:\Windows\System32\LogFiles", # NPS uses IAS folder by default
-    [switch]$RebootIfNeeded = $true
+REM Detect domain context
+for /f "skip=1 tokens=1,*" %%a in ('wmic computersystem get domain ^| findstr /r /v "^$"') do set "MACHINE_DOMAIN=%%a"
+if /I "%MACHINE_DOMAIN%"=="%COMPUTERNAME%" (
+  set "IS_DOMAIN_JOINED=0"
+  set "NPS_GROUP=%COMPUTERNAME%\%VPN_GROUP%"
+) else (
+  set "IS_DOMAIN_JOINED=1"
+  set "NPS_GROUP=%MACHINE_DOMAIN%\%VPN_GROUP%"
 )
 
-function Write-Info($msg){ Write-Host "==> $msg" -ForegroundColor Cyan }
-function Write-Warn($msg){ Write-Host "[!] $msg" -ForegroundColor Yellow }
-function Write-Ok($msg){ Write-Host $msg -ForegroundColor Green }
-function Test-DomainJoined { (Get-WmiObject -Class Win32_ComputerSystem).PartOfDomain }
+:menu
+cls
+echo ============================================================
+echo   RRAS L2TP/IPsec VPN Console  -  Run as Administrator
+echo ============================================================
+echo  Machine domain: %MACHINE_DOMAIN%   (Domain joined: %IS_DOMAIN_JOINED%)
+echo  VPN Group     : %NPS_GROUP%
+echo ------------------------------------------------------------
+echo  1) Full Setup (RRAS + NPS + Logging + RDP hardening)
+echo  2) Add VPN User (local) 
+echo  3) Delete VPN User (local)
+echo  4) Change PSK
+echo  5) Change Client IP Pool
+echo  6) Toggle RDP Restriction (allow ONLY from VPN subnet)
+echo  7) Open GUI tools (RRAS / NPS / Firewall / Users / Logs)
+echo  8) Rollback (remove policy/rules, stop RRAS)
+echo  9) Show Current Status
+echo  Q) Quit
+echo ------------------------------------------------------------
+set /p "choice=Select: "
+if /I "%choice%"=="1" goto setup
+if /I "%choice%"=="2" goto adduser
+if /I "%choice%"=="3" goto deluser
+if /I "%choice%"=="4" goto chgpsk
+if /I "%choice%"=="5" goto chgpool
+if /I "%choice%"=="6" goto rdprestrict
+if /I "%choice%"=="7" goto opengui
+if /I "%choice%"=="8" goto rollback
+if /I "%choice%"=="9" goto status
+if /I "%choice%"=="Q" goto :eof
+goto menu
 
-# مسار حالة/باك أب بسيط للـ Rollback
-$StateDir = "C:\ProgramData\VpnRrasScript"
-$StateFile = Join-Path $StateDir "state.json"
-New-Item -ItemType Directory -Path $StateDir -Force | Out-Null
+:setup
+echo [*] Installing roles (RRAS + NPS) and configuring VPN...
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "Install-WindowsFeature RemoteAccess,Routing,DirectAccess-VPN,NPAS -IncludeManagementTools | Out-Null; " ^
+  "Import-Module RemoteAccess; " ^
+  "if (Get-Service RemoteAccess -ErrorAction SilentlyContinue) { try { Stop-Service RemoteAccess -Force } catch {} } ; " ^
+  "Install-RemoteAccess -VpnType Vpn; " ^
+  "Set-VpnServerConfiguration -TunnelType L2tpOnly -L2tpPsk (ConvertTo-SecureString -String '%PSK%' -AsPlainText -Force) | Out-Null; " ^
+  "Set-VpnAuthProtocol -UserAuthProtocolAccepted MSCHAPv2 | Out-Null; " ^
+  "Set-VpnServerConfiguration -EncryptionType Maximum | Out-Null; " ^
+  "Start-Service RemoteAccess; Set-Service RemoteAccess -StartupType Automatic"
 
-function Save-State($obj){
-    $obj | ConvertTo-Json -Depth 6 | Out-File -FilePath $StateFile -Encoding UTF8
-}
-function Load-State{
-    if (Test-Path $StateFile) { Get-Content $StateFile -Raw | ConvertFrom-Json } else { $null }
-}
+echo [*] Configure client IP pool...
+netsh ras ip set addrassign static >nul
+netsh ras ip delete range all >nul 2>&1
+netsh ras ip add range %VPN_POOL_START% %VPN_POOL_END% >nul
 
-function Ensure-Features {
-    Write-Info "Installing RRAS + NPS roles..."
-    $features = @("RemoteAccess","Routing","DirectAccess-VPN","NPAS")
-    $res = Install-WindowsFeature -Name $features -IncludeManagementTools -ErrorAction Stop
-    if ($res.RestartNeeded -ne "No" -and $RebootIfNeeded) {
-        Write-Warn "Reboot required; restarting now..."
-        Restart-Computer -Force
-        Start-Sleep -Seconds 10
-    }
-}
+echo [*] Open L2TP/IPsec ports (UDP 500, 4500, 1701)...
+netsh advfirewall firewall add rule name="Allow UDP 500 (IKE)"    dir=in action=allow protocol=UDP localport=500  >nul
+netsh advfirewall firewall add rule name="Allow UDP 4500 (NAT-T)" dir=in action=allow protocol=UDP localport=4500 >nul
+netsh advfirewall firewall add rule name="Allow UDP 1701 (L2TP)"  dir=in action=allow protocol=UDP localport=1701 >nul
 
-function Setup-RRAS {
-    Import-Module RemoteAccess -ErrorAction Stop
-    # أوقف الخدمة لو شغالة
-    if (Get-Service RemoteAccess -ErrorAction SilentlyContinue) { try { Stop-Service RemoteAccess -Force } catch {} }
-    Install-RemoteAccess -VpnType Vpn -ErrorAction Stop
+echo [*] Create local VPN group (if missing)...
+net localgroup "%VPN_GROUP%" >nul 2>&1 || net localgroup "%VPN_GROUP%" /add >nul
 
-    Write-Info "Configuring L2TP/IPsec + PSK"
-    Set-VpnServerConfiguration -TunnelType L2tpOnly `
-        -L2tpPsk (ConvertTo-SecureString -String $L2tpPsk -AsPlainText -Force) -PassThru | Out-Null
+echo [*] Enable Firewall logging (dropped + allowed)...
+for %%P in (domainprofile privateprofile publicprofile) do (
+  netsh advfirewall set %%P logging droppedconnections enable >nul
+  netsh advfirewall set %%P logging allowedconnections enable >nul
+  netsh advfirewall set %%P logging filename "%FIREWALL_LOG%" >nul
+  netsh advfirewall set %%P logging maxfilesize %FIREWALL_LOG_MAXKB% >nul
+)
 
-    if ($HardenAuthToMschapv2) {
-        Write-Info "Restricting user auth to MS-CHAPv2"
-        Set-VpnAuthProtocol -UserAuthProtocolAccepted MSCHAPv2 | Out-Null
-    }
-    if ($RequireMaxEncryption) {
-        Write-Info "Requiring maximum encryption"
-        Set-VpnServerConfiguration -EncryptionType Maximum -PassThru | Out-Null
-    }
+echo [*] Configure NPS logging and policy...
+REM Register NPS in AD if domain-joined (needs Domain Admin)
+if "%IS_DOMAIN_JOINED%"=="1" (
+  netsh nps add registeredserver >nul 2>&1
+)
+REM NPS logs (IAS format)
+netsh nps set logging accounting enable=yes >nul 2>&1
+netsh nps set logging authentication enable=yes >nul 2>&1
+netsh nps set logging logfile format=ias path="C:\Windows\System32\LogFiles" rollover=Daily >nul 2>&1
 
-    Write-Info "Setting static IPv4 address pool $VpnPoolStart - $VpnPoolEnd"
-    & netsh ras ip set addrassign static | Out-Null
-    try { & netsh ras ip delete range all | Out-Null } catch {}
-    & netsh ras ip add range $VpnPoolStart $VpnPoolEnd | Out-Null
+REM Create/replace Network Policy that grants VPN for the group
+netsh nps delete np name="VPN Access (Console)" >nul 2>&1
+netsh nps add np name="VPN Access (Console)" processingorder=1 state=enabled grant=Grant >nul
+netsh nps add condition policyname="VPN Access (Console)" conditionid="NAS-Port-Type" value="Virtual (VPN)" >nul
+netsh nps add condition policyname="VPN Access (Console)" conditionid="Windows-Groups" value="%NPS_GROUP%" >nul 2>&1
+netsh nps set np name="VPN Access (Console)" allowmicrosoftchapv2=enable >nul
+netsh nps set np name="VPN Access (Console)" allowpap=disable allowchap=disable allowmschap=disable >nul
+netsh nps set np name="VPN Access (Console)" encryptionlevel=strongest >nul
 
-    Start-Service RemoteAccess
-    Set-Service RemoteAccess -StartupType Automatic
+REM RDP hardening (enable allow-from-VPN only + block others)
+call :apply_rdprestrict on
 
-    Write-Info "Opening L2TP/IPsec firewall ports (UDP 500/4500/1701)"
-    $fwGroup = "RRAS L2TP/IPsec (Script)"
-    $fwRules = @(
-        @{Name="Allow UDP 500 (IKE)";    Proto="UDP"; Port=500},
-        @{Name="Allow UDP 4500 (IPsec NAT-T)"; Proto="UDP"; Port=4500},
-        @{Name="Allow UDP 1701 (L2TP)";  Proto="UDP"; Port=1701}
-    )
-    foreach ($r in $fwRules) {
-        if (-not (Get-NetFirewallRule -DisplayName $r.Name -ErrorAction SilentlyContinue)) {
-            New-NetFirewallRule -DisplayName $r.Name -Group $fwGroup -Direction Inbound -Action Allow -Protocol $r.Proto -LocalPort $r.Port | Out-Null
-        }
-    }
+echo.
+echo [OK] Setup done.
+pause
+goto menu
 
-    if ($RestrictRdp) {
-        Write-Info "Hardening RDP: allow only from VPN subnet $VpnSubnetCidr"
-        Get-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue | ForEach-Object {
-            try { Set-NetFirewallRule -Name $_.Name -Enabled False } catch {}
-        }
-        if (-not (Get-NetFirewallRule -DisplayName "Allow RDP from VPN ($VpnSubnetCidr)" -ErrorAction SilentlyContinue)) {
-            New-NetFirewallRule -DisplayName "Allow RDP from VPN ($VpnSubnetCidr)" `
-                -Direction Inbound -Action Allow -Protocol TCP -LocalPort 3389 `
-                -RemoteAddress $VpnSubnetCidr -Profile Any -Program System | Out-Null
-        }
-        if (-not (Get-NetFirewallRule -DisplayName "Block RDP from non-VPN" -ErrorAction SilentlyContinue)) {
-            New-NetFirewallRule -DisplayName "Block RDP from non-VPN" `
-                -Direction Inbound -Action Block -Protocol TCP -LocalPort 3389 -Profile Any -Program System | Out-Null
-        }
-    }
-}
+:adduser
+set "USR="
+set "PWD="
+echo Enter new local username:
+set /p "USR=> "
+if "%USR%"=="" goto menu
+echo Enter password (visible while typing):
+set /p "PWD=> "
+if "%PWD%"=="" goto menu
 
-function Setup-Logging {
-    if (-not $EnableLogging) { return }
-    Write-Info "Enabling Windows Firewall logging (dropped + allowed)"
-    # فعّل اللوج لكل البروفايلات
-    foreach ($profile in @("domainprofile","privateprofile","publicprofile")){
-        & netsh advfirewall set $profile logging droppedconnections enable | Out-Null
-        & netsh advfirewall set $profile logging allowedconnections enable | Out-Null
-        & netsh advfirewall set $profile logging filename "$FirewallLogPath" | Out-Null
-        & netsh advfirewall set $profile logging maxfilesize $FirewallLogMaxKB | Out-Null
-    }
+net user "%USR%" "%PWD%" /add /expires:never /y
+if errorlevel 1 ( echo [!] Failed to create user & pause & goto menu )
+net localgroup "%VPN_GROUP%" "%USR%" /add
+if errorlevel 1 ( echo [!] Created user but failed to add to group "%VPN_GROUP%". & pause & goto menu )
+echo [OK] User "%USR%" created and added to "%VPN_GROUP%".
+pause
+goto menu
 
-    Write-Info "Enabling NPS accounting to file"
-    # إعدادات NPS logging الافتراضية (IAS log) — تمكين Log to File + daily rollover
-    # netsh nps set logging has two parts: accounting and authentication logging
-    try {
-        & netsh nps set logging accounting enable=yes | Out-Null
-        & netsh nps set logging authentication enable=yes | Out-Null
-        & netsh nps set logging logfile format=ias path="$NpsLogFolder" rollover=Daily | Out-Null
-    } catch { Write-Warn "Could not fully apply NPS logging settings (netsh nps). Continuing..." }
+:deluser
+set "USR="
+echo Enter local username to delete:
+set /p "USR=> "
+if "%USR%"=="" goto menu
+net user "%USR%" >nul 2>&1 || ( echo [!] User not found & pause & goto menu )
+net user "%USR%" /delete
+if errorlevel 1 ( echo [!] Failed to delete user & pause & goto menu )
+echo [OK] User "%USR%" deleted.
+pause
+goto menu
 
-    Write-Info "Configuring RRAS to use NPS for accounting"
-    try {
-        Import-Module RemoteAccess -ErrorAction Stop
-        Set-RemoteAccessAccounting -AccountingOnNpsServer -PassThru | Out-Null
-    } catch { Write-Warn "RRAS accounting via NPS not fully applied. Continuing..." }
-}
+:chgpsk
+set "NEWPSK="
+echo Enter NEW L2TP PSK:
+set /p "NEWPSK=> "
+if "%NEWPSK%"=="" goto menu
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "Import-Module RemoteAccess; Set-VpnServerConfiguration -TunnelType L2tpOnly -L2tpPsk (ConvertTo-SecureString -String '%NEWPSK%' -AsPlainText -Force) | Out-Null"
+if errorlevel 1 ( echo [!] Failed to set PSK & pause & goto menu )
+set "PSK=%NEWPSK%"
+echo [OK] PSK updated.
+pause
+goto menu
 
-function Setup-NPS {
-    Write-Info "Configuring NPS + Policy (allow only group: $VpnGroup)"
-    # تسجيل NPS في AD (لو الدومين متاح)
-    if (Test-DomainJoined) {
-        try {
-            & netsh nps add registeredserver | Out-Null
-            Write-Ok "NPS registered in Active Directory."
-        } catch { Write-Warn "Could not register NPS in AD (need Domain Admin). You can register later from NPS console." }
-    } else {
-        Write-Warn "Server not domain-joined. NPS group policy will not work. Join to AD or use local users."
-    }
+:chgpool
+set "NEWSTART="
+set "NEWEND="
+set "NEWCIDR="
+echo Enter NEW pool start IP (e.g., 10.10.50.100):
+set /p "NEWSTART=> "
+echo Enter NEW pool end IP (e.g., 10.10.50.200):
+set /p "NEWEND=> "
+echo Enter VPN subnet CIDR for firewall allow (e.g., 10.10.50.0/24):
+set /p "NEWCIDR=> "
+if "%NEWSTART%"=="" goto menu
+if "%NEWEND%"=="" goto menu
+if "%NEWCIDR%"=="" goto menu
 
-    # إنشاء Network Policy تسمح لجروب $VpnGroup + نوع منفذ VPN
-    # ملاحظة: netsh nps syntax varies by OS language; ده أفضل جهد تلقائي.
-    try {
-        # احذف أي Policy قديم بنفس الاسم
-        & netsh nps delete np name="VPN Access (Script)" | Out-Null 2>$null
+netsh ras ip set addrassign static >nul
+netsh ras ip delete range all >nul 2>&1
+netsh ras ip add range %NEWSTART% %NEWEND% >nul
+if errorlevel 1 ( echo [!] Failed to set pool & pause & goto menu )
 
-        & netsh nps add np name="VPN Access (Script)" processingorder=1 state=enabled grant=Grant | Out-Null
-        # شرط: NAS-Port-Type = Virtual (VPN)
-        & netsh nps add condition policyname="VPN Access (Script)" conditionid="NAS-Port-Type" value="Virtual (VPN)" | Out-Null
-        # شرط: Windows-Group = Domain\VPN_Users
-        $domain = (Get-WmiObject -Class Win32_ComputerSystem).Domain
-        if ($domain -and $domain -ne $env:COMPUTERNAME) {
-            & netsh nps add condition policyname="VPN Access (Script)" conditionid="Windows-Groups" value="$domain\$VpnGroup" | Out-Null
-        } else {
-            Write-Warn "No AD domain detected — skipping Windows-Groups condition."
-        }
+set "VPN_POOL_START=%NEWSTART%"
+set "VPN_POOL_END=%NEWEND%"
+set "VPN_SUBNET_CIDR=%NEWCIDR%"
 
-        # مصادقة: MS-CHAPv2 فقط + أقصى تشفير
-        & netsh nps set np name="VPN Access (Script)" allowmicrosoftchapv2=enable | Out-Null
-        & netsh nps set np name="VPN Access (Script)" allowpap=disable allowchap=disable allowmschap=disable | Out-Null
-        # تفعيل تشفير قوي (يتبع إعداد RRAS)
-        & netsh nps set np name="VPN Access (Script)" encryptionlevel=strongest | Out-Null
-        Write-Ok "NPS Network Policy created."
-    } catch {
-        Write-Warn "Could not fully create NPS policy via netsh. You may need to finish it in NPS console (nps.msc)."
-    }
+REM Update RDP rule to match new subnet
+call :apply_rdprestrict refresh
 
-    # اجعل RRAS يعتمد على NPS في الـ AuthZ/Policy
-    try {
-        # RRAS already uses NPS locally when NPAS is installed; ensure delegation is set
-        Set-RemoteAccess -UseRadius $false -PassThru | Out-Null  # keep local NPS
-        Write-Ok "RRAS set to use local NPS policies."
-    } catch {}
-}
+echo [OK] VPN pool updated.
+pause
+goto menu
 
-function Save-Prestate {
-    Write-Info "Saving current state for rollback"
-    $state = [ordered]@{
-        Timestamp = (Get-Date)
-        RdpRules = (Get-NetFirewallRule -DisplayGroup "Remote Desktop" | Select-Object Name, Enabled)
-        CustomRules = (Get-NetFirewallRule | Where-Object {$_.DisplayName -like "*RRAS L2TP/IPsec (Script)*" -or $_.DisplayName -like "Allow RDP from VPN*" -or $_.DisplayName -eq "Block RDP from non-VPN"} | Select-Object Name, DisplayName)
-        RemoteAccessStatus = (Get-Service RemoteAccess -ErrorAction SilentlyContinue | Select-Object Status)
-        NpsPolicyExists = (& netsh nps show np name="VPN Access (Script)" 2>$null) -ne $null
-        RasAddrRanges = (& netsh ras ip show range)
-        FirewallLogConfigured = $EnableLogging
-    }
-    Save-State $state
-}
+:rdprestrict
+echo 1) Enable RDP restriction (only from VPN subnet)
+echo 2) Disable RDP restriction (restore default Remote Desktop rules)
+set /p "opt=> "
+if "%opt%"=="1" ( call :apply_rdprestrict on & goto menu )
+if "%opt%"=="2" ( call :apply_rdprestrict off & goto menu )
+goto menu
 
-function Do-Rollback {
-    Write-Info "ROLLBACK: reverting changes where possible"
-    # رجّع قواعد RDP الافتراضية
-    $rdp = Get-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
-    if ($rdp) { $rdp | ForEach-Object { try { Set-NetFirewallRule -Name $_.Name -Enabled True } catch {} } }
+:apply_rdprestrict
+REM %1 = on/off/refresh
+if /I "%1"=="off" (
+  netsh advfirewall firewall delete rule name="Allow RDP from VPN (%VPN_SUBNET_CIDR%)" >nul 2>&1
+  netsh advfirewall firewall delete rule name="Block RDP from non-VPN" >nul 2>&1
+  netsh advfirewall set rule group="remote desktop" new enable=yes >nul
+  echo [OK] RDP restriction disabled.
+  goto :eof
+)
 
-    # احذف قواعدنا
-    @("Allow UDP 500 (IKE)","Allow UDP 4500 (IPsec NAT-T)","Allow UDP 1701 (L2TP)",
-      "Allow RDP from VPN ($VpnSubnetCidr)","Block RDP from non-VPN") | ForEach-Object {
-        $r = Get-NetFirewallRule -DisplayName $_ -ErrorAction SilentlyContinue
-        if ($r){ try { $r | Remove-NetFirewallRule } catch {} }
-    }
+if /I "%1"=="on" (
+  netsh advfirewall set rule group="remote desktop" new enable=no >nul
+)
 
-    # أوقف RRAS
-    if (Get-Service RemoteAccess -ErrorAction SilentlyContinue){ try { Stop-Service RemoteAccess -Force } catch {} }
+REM refresh or on -> ensure custom rules exist (recreate)
+netsh advfirewall firewall delete rule name="Allow RDP from VPN (%VPN_SUBNET_CIDR%)" >nul 2>&1
+netsh advfirewall firewall delete rule name="Block RDP from non-VPN" >nul 2>&1
 
-    # احذف NPS policy اللي أنشأناه
-    try { & netsh nps delete np name="VPN Access (Script)" | Out-Null } catch {}
+netsh advfirewall firewall add rule name="Allow RDP from VPN (%VPN_SUBNET_CIDR%)" ^
+  dir=in action=allow protocol=TCP localport=3389 remoteip=%VPN_SUBNET_CIDR% program=System profile=any >nul
 
-    Write-Ok "Rollback done (manual review recommended)."
-}
+netsh advfirewall firewall add rule name="Block RDP from non-VPN" ^
+  dir=in action=block protocol=TCP localport=3389 program=System profile=any >nul
 
-# ============= MAIN FLOW =============
-if (-not ($Setup -xor $Rollback)) {
-    Write-Warn "Specify exactly one of: -Setup OR -Rollback"
-    break
-}
+echo [OK] RDP allowed only from %VPN_SUBNET_CIDR%.
+goto :eof
 
-if ($Setup) {
-    Ensure-Features
-    Save-Prestate
-    Setup-RRAS
-    Setup-Logging
-    Setup-NPS
+:opengui
+echo ------------------------------------------------------------
+echo 1) RRAS console               (rrasmgmt.msc)
+echo 2) NPS console                (nps.msc)
+echo 3) Windows Firewall (Advanced) (wf.msc)
+echo 4) Local Users and Groups     (lusrmgr.msc)
+echo 5) Event Viewer (NPS/RRAS logs)
+echo 6) Open Firewall log file
+echo 7) Open logs folder
+echo B) Back
+echo ------------------------------------------------------------
+set /p "g=Open: "
+if /I "%g%"=="1" start mmc.exe rrasmgmt.msc
+if /I "%g%"=="2" start mmc.exe nps.msc
+if /I "%g%"=="3" start wf.msc
+if /I "%g%"=="4" start lusrmgr.msc
+if /I "%g%"=="5" start eventvwr.msc
+if /I "%g%"=="6" start notepad.exe "%FIREWALL_LOG%"
+if /I "%g%"=="7" explorer.exe "C:\Windows\System32\LogFiles"
+goto menu
 
-    Write-Host "`n==================== SUMMARY ====================" -ForegroundColor Green
-    Write-Host "VPN Type     : L2TP/IPsec (PSK)"
-    Write-Host "PSK          : $L2tpPsk"
-    Write-Host "Client Pool  : $VpnPoolStart - $VpnPoolEnd  ($VpnSubnetCidr)"
-    Write-Host "Ports Open   : UDP 500, UDP 4500, UDP 1701"
-    if ($RestrictRdp) { Write-Host "RDP Access   : VPN subnet only ($VpnSubnetCidr)" }
-    try { Write-Host ("RRAS Service : " + (Get-Service RemoteAccess).Status) } catch {}
-    Write-Host "NPS Policy   : VPN Access (Script) (group: $VpnGroup)"
-    if ($EnableLogging) {
-        Write-Host "FW Logging   : $FirewallLogPath (max ${FirewallLogMaxKB}KB)"
-        Write-Host "NPS Logs     : $NpsLogFolder"
-    }
-    Write-Host "Rollback     : Run with -Rollback to revert"
-    Write-Host "=================================================" -ForegroundColor Green
+:rollback
+echo [!] This will stop RRAS, remove custom firewall rules and NPS policy "VPN Access (Console)".
+choice /M "Proceed"
+if errorlevel 2 goto menu
 
-    Write-Ok "`nIMPORTANT: Forward UDP 500/4500/1701 on your edge device to this server."
-    if (Test-DomainJoined) {
-        Write-Ok "Ensure AD group '$VpnGroup' exists and add users to it."
-    } else {
-        Write-Warn "Server is not domain-joined; NPS group condition will be skipped."
-    }
-}
+netsh advfirewall firewall delete rule name="Allow UDP 500 (IKE)" >nul 2>&1
+netsh advfirewall firewall delete rule name="Allow UDP 4500 (NAT-T)" >nul 2>&1
+netsh advfirewall firewall delete rule name="Allow UDP 1701 (L2TP)" >nul 2>&1
+netsh advfirewall firewall delete rule name="Allow RDP from VPN (%VPN_SUBNET_CIDR%)" >nul 2>&1
+netsh advfirewall firewall delete rule name="Block RDP from non-VPN" >nul 2>&1
+netsh advfirewall set rule group="remote desktop" new enable=yes >nul
 
-if ($Rollback) {
-    Do-Rollback
-}
+netsh nps delete np name="VPN Access (Console)" >nul 2>&1
 
-ملاحظات سريعة:
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "if (Get-Service RemoteAccess -ErrorAction SilentlyContinue) { try { Stop-Service RemoteAccess -Force } catch {} }"
 
-إنشاء/تعديل Policies في NPS عن طريق netsh nps بيختلف شوية حسب نسخة الويندوز/لغة النظام؛ السكربت بيحاول يعمل Policy باسم “VPN Access (Script)”. لو فشل (هتشوف تحذير)، افتح nps.msc وكمل يدوي:
+echo [OK] Rollback complete. (Roles/features remain installed.)
+pause
+goto menu
 
-Network Policies → New → Grant access → Conditions: Windows Groups = DOMAIN\VPN_Users, و NAS Port Type = Virtual (VPN) → Authentication: MS-CHAPv2 فقط → Encryption: أقصى.
+:status
+cls
+echo ===== Current Status =====
+echo PSK           : (hidden)
+echo Pool          : %VPN_POOL_START% - %VPN_POOL_END%
+echo VPN Subnet    : %VPN_SUBNET_CIDR%
+echo VPN Group     : %NPS_GROUP%
+echo ---------------
+echo RRAS service:
+powershell -NoProfile -ExecutionPolicy Bypass -Command ^
+  "Get-Service RemoteAccess | Select-Object Status,StartType | Format-List"
+echo ---------------
+echo NPS policy:
+netsh nps show np name="VPN Access (Console)" | findstr /r /c:"Name" /c:"State" /c:"Processing"
+echo ---------------
+echo Firewall rules (L2TP/IPsec + RDP restriction):
+netsh advfirewall firewall show rule name="Allow UDP 500 (IKE)"    | findstr /c:"Enabled" /c:"LocalPort" /c:"Direction"
+netsh advfirewall firewall show rule name="Allow UDP 4500 (NAT-T)" | findstr /c:"Enabled" /c:"LocalPort" /c:"Direction"
+netsh advfirewall firewall show rule name="Allow UDP 1701 (L2TP)"  | findstr /c:"Enabled" /c:"LocalPort" /c:"Direction"
+netsh advfirewall firewall show rule name="Allow RDP from VPN (%VPN_SUBNET_CIDR%)" | findstr /c:"Enabled" /c:"LocalPort" /c:"RemoteIP"
+echo ==========================
+pause
+goto menu
 
+إزاي تستخدم الـ Console App
 
-لو السيرفر مش عضو دومين، سياسة الجروب مش هتشتغل؛ استخدم مستخدمين محليين أو انضم للدومين.
-
-الـ Logging:
-
-فايروول: الملف في C:\Windows\System32\LogFiles\Firewall\pfirewall.log.
-
-NPS: ملفات IAS داخل C:\Windows\System32\LogFiles (تظهر بعد أول اتصالات).
+1. افتح CMD كـ Administrator.
 
 
-Rollback بيرجع القواعد الافتراضية للـ RDP، ويحذف القواعد والسياسة التي أنشأها السكربت، ويوقف RRAS. لو كنت معدّل حاجات يدوي قبل كده، راجع بعد الاسترجاع.
+2. نفّذ VpnConsole.cmd.
 
 
-لو تحب أضيف IKEv2 جنب L2TP وPolicy مقابلة له، أظبطهولك في نسخة تانية.
+3. اختَر 1) Full Setup لأول مرة. دا هي:
 
+يثبّت الأدوار: RRAS + NPS.
+
+يفعّل L2TP/IPsec بمفتاح PSK.
+
+يضبط رينج عناوين العملاء.
+
+يفتح بورتات UDP 500/4500/1701.
+
+يفعّل Logging للفايروول + NPS.
+
+ينشئ Policy في NPS تسمح فقط لأعضاء VPN_Users.
+
+يقيّد RDP بحيث مسموح فقط من شبكة الـ VPN.
+
+
+
+4. استخدم 2) Add VPN User لإضافة مستخدم محلي بسرعة (بينضم لجروب VPN_Users).
+
+
+5. لو عايز تشيل مستخدم: 3) Delete VPN User.
+
+
+6. لتغيير PSK أو IP Pool: اختَر الخيارات 4 أو 5.
+
+
+7. 6) Toggle RDP Restriction لو عايز تفعل/تعطّل تقييد الـ RDP.
+
+
+8. 7) Open GUI tools لفتح الأدوات الرسومية مباشرة (RRAS/NPS/Firewall/Users/Logs).
+
+
+9. 8) Rollback يرجّع أغلب التغييرات: يوقف RRAS، يحذف قواعد الفايروول وسياسة NPS اللي عملناها، ويعيد قواعد RDP الافتراضية. (لن يزيل الأدوار المثبتة).
+
+
+10. 9) Show Current Status يعرض حالة الخدمة والسياسات والقواعد.
+
+
+
+ملاحظات مهمة
+
+Port Forward على الراوتر/الفايروول الخارجي مطلوب:
+UDP 500, 4500, 1701 → على IP السيرفر.
+
+لو السيرفر عضو دومين وتملك صلاحيات Domain Admin، الاختيار 1 هيحاول Register NPS في AD تلقائيًا. لو معندكش الصلاحية، كمل التسجيل من nps.msc يدويًا.
+
+سياسة NPS اللي بيعملها السكربت اسمها: VPN Access (Console) وبترخّص لأعضاء %NPS_GROUP%.
+
+إدارة “Dial-in” لكل مستخدم مش مطلوبة لو بتستخدم NPS + Group (وهو الأفضل).
+
+تنبيه كلمة السر في إضافة المستخدم: الإدخال غير مخفي في CMD. ممكن تستخدم GUI lusrmgr.msc من قائمة GUI لو تفضّل.
+
+لو حبيت تضيف IKEv2 كمان، أقدر أديك تحديث بسيط يضيف أمر PowerShell لتمكينه جنب L2TP.
+
+
+لو عايز أحوله لنسخة PowerShell كاملة بواجهة قائمة مشابهة (أنظف وأسهل في التعامل مع الـ cmdlets)، أو تضيف خيارات متقدمة (Geo-IP blocking، Certificates بدلاً من PSK…)، قولي واظبطهالك.
 
